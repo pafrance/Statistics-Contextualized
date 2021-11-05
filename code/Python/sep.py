@@ -5,6 +5,7 @@ See https://github.com/INTERSTAT/Statistics-Contextualized/blob/main/test-case.m
 '''
 from prefect import task, Flow, Parameter
 from prefect.engine.state import Failed, Success
+from prefect.tasks.prefect import StartFlowRun
 from requests import get, post, delete
 from zipfile import ZipFile
 from io import BytesIO
@@ -14,9 +15,6 @@ from rdflib import Graph, Literal, RDF, URIRef, Namespace #basic RDF handling
 from rdflib.namespace import RDF, RDFS, XSD, QB #most common namespaces
 import urllib.parse #for parsing strings to URI's
 import numpy as np
-
-# Constants ----
-PUSH_TO_PREFECT_CLOUD_DASHBOARD = False
 
 # Fns ----
 
@@ -67,8 +65,8 @@ def raw_italian_to_standard(df, age_classes):
 @task
 def import_dsd():
     g = Graph()
-    g.parse("https://raw.githubusercontent.com/INTERSTAT/Statistics-Contextualized/main/sep-dsd-1.ttl", format="turtle")
-    return g.serialize(format="turtle")
+    g.parse('https://raw.githubusercontent.com/INTERSTAT/Statistics-Contextualized/main/sep-dsd-1.ttl', format='turtle')
+    return g.serialize(format='turtle')
 
 @task
 def get_age_class_data():
@@ -89,9 +87,9 @@ def extract_french_census(url, age_classes, nuts3):
     resp = get(url)
     zip = ZipFile(BytesIO(resp.content))
     file_in_zip = zip.namelist().pop()
-    df = pd.read_csv(zip.open(file_in_zip), sep=';', dtype="string")
-    df["NB"] = df["NB"].astype("float64")
-    df["AGED100"] = df["AGED100"].astype("int")
+    df = pd.read_csv(zip.open(file_in_zip), sep=';', dtype='string')
+    df['NB'] = df['NB'].astype('float64')
+    df['AGED100'] = df['AGED100'].astype('int')
     standard_df = raw_french_to_standard(df, age_classes, nuts3)
     return standard_df
 
@@ -100,7 +98,7 @@ def extract_italian_census(url, age_classes):
     resp = get(url)
     zip = ZipFile(BytesIO(resp.content))
     file_in_zip = zip.namelist().pop()
-    df = pd.read_csv(zip.open(file_in_zip), sep=',', dtype="string")
+    df = pd.read_csv(zip.open(file_in_zip), sep=',', dtype='string')
     print(df)
     standard_df = raw_italian_to_standard(df, age_classes)
     return standard_df
@@ -166,9 +164,9 @@ def delete_graph(url):
     res_delete = delete(url)
 
     if res_delete.status_code != 204:
-        return Failed(f"Delete graph failed: {str(res_delete.status_code)}")
+        return Failed(f'Delete graph failed: {str(res_delete.status_code)}')
     else: 
-        return Success(f"Graph deleted")
+        return Success(f'Graph deleted')
 
 @task
 def load_turtle(ttl, url):
@@ -177,37 +175,65 @@ def load_turtle(ttl, url):
     res_post = post(url, data=ttl, headers=headers)
 
     if res_post.status_code != 204:
-        return Failed(f"Post graph failed: {str(res_post.status_code)}")
+        return Failed(f'Post graph failed: {str(res_post.status_code)}')
     else:
-        return Success(f"Graph loaded")
-    
+        return Success(f'Graph loaded')
 
-with Flow('census_csv_to_rdf') as flow:
 
-    repo_url = Parameter('repo_url', default="https://interstat.opsi-lab.it/graphdb/repositories/sep-test/statements?context=<http://www.interstat.org/graphs/sep>")
+# Flows
 
+with Flow('sep_clean_graph') as sep_clean_graph:
+    repo_url = Parameter(name='repo_url', required=True)
     delete_graph(repo_url)
-
+    
+with Flow('sep_census_metadata') as sep_census_metadata:
+    repo_url = Parameter(name='repo_url', required=True)
     dsd_rdf = import_dsd()
     load_turtle(dsd_rdf, repo_url)
 
+with Flow('sep_extract_data') as sep_extract_data:
     age_classes = get_age_class_data()
     nuts3 = get_nuts3()
 
-    french_census_data_url = Parameter('fr_url', default='https://www.insee.fr/fr/statistiques/fichier/5395878/BTT_TD_POP1B_2018.zip')
-    french_census = extract_french_census(french_census_data_url, age_classes, nuts3)
+    fr_url = Parameter(name='fr_url', required=True)
+    french_census = extract_french_census(fr_url, age_classes, nuts3)
 
-    italian_census_data_url = Parameter('it_url', default='https://minio.lab.sspcloud.fr/l4tu7k/census-it.zip')
-    italian_census = extract_italian_census(italian_census_data_url, age_classes)
+    # it_url = Parameter(name='it_url', required=True)
+    # italian_census = extract_italian_census(it_url, age_classes)
 
-    df = concat_datasets(french_census, italian_census)
+    # df_clean = concat_datasets(french_census, italian_census)
 
-    census_rdf = build_rdf_data(french_census)
+with Flow('sep_census_transform_rdf') as sep_census_transform_rdf:
+    census_df = Parameter(name='census_df', required=True)
+    census_rdf = build_rdf_data(census_df)
 
+with Flow('sep_census_publish_rdf') as sep_census_publish_rdf:
+    census_rdf = Parameter(name='census_rdf', required=True)
+    repo_url = Parameter(name='repo_url', required=True)
     flow_status = load_turtle(census_rdf, repo_url)
 
+flow_sep_clean_graph = StartFlowRun(flow_name='sep_clean_graph', project_name='sep')
+flow_sep_census_metadata = StartFlowRun(flow_name='sep_census_metadata', project_name='sep')
+flow_sep_extract_data = StartFlowRun(flow_name='sep_extract_data', project_name='sep')
+flow_sep_census_transform_rdf = StartFlowRun(flow_name='sep_census_transform_rdf', project_name='sep')
+flow_sep_census_publish_rdf = StartFlowRun(flow_name='sep_census_publish_rdf', project_name='sep')
+
+with Flow('sep_main_flow') as sep_main_flow:
+    repo_url = Parameter('repo_url', default='https://interstat.opsi-lab.it/graphdb/repositories/sep-test/statements?context=<http://www.interstat.org/graphs/sep>')
+    fr_url = Parameter('fr_url', default='https://www.insee.fr/fr/statistiques/fichier/5395878/BTT_TD_POP1B_2018.zip')
+    it_url = Parameter('it_url', default='https://minio.lab.sspcloud.fr/l4tu7k/census-it.zip')
+
+    flow_clean = flow_sep_clean_graph(parameters={'repo_url': repo_url})
+    flow_sep_census_metadata(parameters={'repo_url': repo_url}, upstream_tasks=[flow_clean])
+    flow_extract = flow_sep_extract_data(parameters={'fr_url': fr_url, 'it_url': it_url}, upstream_tasks=[flow_clean])
+    # flow_sep_census_transform_rdf(parameters={'census_df': flow_extract.result[extract_french_census].result})
+    # flow_sep_census_publish_rdf(parameters={'repo_url': repo_url, 'census_rdf': flow_extract.result['census_rdf']})
+
 if __name__ == '__main__':
-    if PUSH_TO_PREFECT_CLOUD_DASHBOARD:
-        flow.register(project_name='sep')
-    else:
-        flow.run()
+    sep_clean_graph.register(project_name='sep')
+    sep_census_metadata.register(project_name='sep')
+    sep_extract_data.register(project_name='sep')
+    sep_census_transform_rdf.register(project_name='sep')
+    sep_census_publish_rdf.register(project_name='sep')
+    sep_main_flow.register(project_name='sep')
+    sep_main_flow.run()
